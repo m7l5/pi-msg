@@ -314,15 +314,17 @@ function startBridge(pi: ExtensionAPI, name: string): void {
             if (inboxMode) {
               writeInbox(sessionName!, msg.from, msg.text);
             } else {
-              sendBridgeMessage(pi, msg.from, msg.text, "incoming");
-              triggerAgentTurn(pi);
-              if (msg.expectAnswer) {
-                setTimeout(() => {
+              const delivered = sendBridgeMessage(pi, msg.from, msg.text, "incoming");
+              if (delivered) {
+                if (msg.expectAnswer) {
+                  // expectAnswer prompt triggers the agent turn on its own — no 👆 needed
                   pi.sendUserMessage(
                     `The message above from "${msg.from}" expects a reply. ` +
                       `Compose a brief response and send it back using bridge_send with target="${msg.from}".`,
                   );
-                }, 100);
+                } else {
+                  triggerAgentTurn(pi);
+                }
               }
             }
           }
@@ -387,8 +389,8 @@ function send(target: string, msg: BridgeMessage, fromSession?: string): Promise
 
 // ─── Extension ───────────────────────────────────────────
 
-function sendBridgeMessage(pi: ExtensionAPI, from: string, text: string, direction: "incoming" | "outgoing" = "incoming", to?: string): void {
-  if (direction === "incoming" && isDuplicate(from, text)) return;
+function sendBridgeMessage(pi: ExtensionAPI, from: string, text: string, direction: "incoming" | "outgoing" = "incoming", to?: string): boolean {
+  if (direction === "incoming" && isDuplicate(from, text)) return false;
   // LLM sees the bridge context in content; TUI pulls raw text from details
   const content = direction === "incoming"
     ? `📨 [bridge] Message from **${from}**: ${text}`
@@ -399,6 +401,7 @@ function sendBridgeMessage(pi: ExtensionAPI, from: string, text: string, directi
     display: true,
     details: { from, direction, to, rawText: text },
   });
+  return true;
 }
 
 // Trigger agent to respond to bridge messages (custom messages don't auto-start turns)
@@ -417,10 +420,13 @@ function triggerAgentTurn(pi: ExtensionAPI): void {
 
 // Inject many messages — each gets its own bubble + triggers agent
 function injectMany(pi: ExtensionAPI, messages: Array<{ from: string; text: string }>): void {
+  let anyDelivered = false;
   for (const m of messages) {
-    sendBridgeMessage(pi, m.from, m.text, "incoming");
+    if (sendBridgeMessage(pi, m.from, m.text, "incoming")) {
+      anyDelivered = true;
+    }
   }
-  triggerAgentTurn(pi);
+  if (anyDelivered) triggerAgentTurn(pi);
 }
 
 export default function sessionBridgeExtension(pi: ExtensionAPI) {
