@@ -1,0 +1,10 @@
+{
+  "name": "pi-session-bridge",
+  "version": "0.1.0",
+  "description": "Let Pi sessions talk to each other via Unix sockets",
+  "keywords": ["pi-package", "pi-extension"],
+  "license": "Apache-2.0",
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
