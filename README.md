@@ -39,6 +39,7 @@ Or ask your AI to compose one:
 | Command | Description |
 |---------|-------------|
 | `/msg-on [name]` | Join the msg network (uses session name if omitted) |
+| `/msg-on --force [name]` | Take over a stale name left by a crashed session |
 | `/msg-off` | Leave the msg network |
 | `/msg-list` | List online sessions |
 | `/msg-send <name> <text>` | Send a raw message |

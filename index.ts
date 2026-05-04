@@ -832,12 +832,15 @@ export default function msgExtension(pi: ExtensionAPI) {
   // ── /msg-on ─────────────────────────────────────────
   pi.registerCommand("msg-on", {
     description:
-      "Join the msg network. Use --inbox to queue messages for review instead of real-time delivery.",
+      "Join the msg network. Use --inbox to queue messages for review instead of real-time delivery. Use --force to take over a stale name.",
     handler: async (args, ctx) => {
       const raw = (args || "").trim();
       inboxMode = raw.includes("--inbox");
+      const force = raw.includes("--force");
       const name =
-        raw.replace("--inbox", "").trim() || ctx.sessionManager.getSessionName() || getHostName();
+        raw.replace("--inbox", "").replace("--force", "").trim() ||
+        ctx.sessionManager.getSessionName() ||
+        getHostName();
       if (ctx.sessionManager.getSessionName() === name && server) {
         ctx.ui.notify(`Already on msg network as "${name}"`, "info");
         return;
@@ -848,11 +851,27 @@ export default function msgExtension(pi: ExtensionAPI) {
       const existing = registry[name];
       const mySessionFile = ctx.sessionManager.getSessionFile();
       if (existing && mySessionFile && existing.sessionFile !== mySessionFile) {
-        ctx.ui.notify(
-          `Msg name "${name}" is already used by another session. Use /msg-on <unique-name>.`,
-          "error",
-        );
-        return;
+        if (!force) {
+          const alive = await probe(name);
+          if (alive) {
+            ctx.ui.notify(
+              `Msg name "${name}" is currently active on another session. Use /msg-on --force to take it over.`,
+              "error",
+            );
+            return;
+          }
+          // Stale entry — clean it up and continue
+        }
+        delete registry[name];
+        writeRegistry(registry);
+        if (existsSync(socketPath(name))) {
+          try {
+            unlinkSync(socketPath(name));
+          } catch {
+            /* ignore */
+          }
+        }
+        ctx.ui.notify(`Cleared stale name "${name}" from previous session.`, "info");
       }
 
       // Check for session name collision — another Pi session with same /name?
