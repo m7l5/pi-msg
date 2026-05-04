@@ -1274,22 +1274,24 @@ export default function msgExtension(pi: ExtensionAPI) {
       }
 
       // Show styled compose bubble (collapsed = label only, expanded = full task)
-      // Content is sent to LLM as user message context. User message is just a trigger.
-      pi.sendMessage({
-        customType: "msg-tell",
-        content:
-          `Send a message to the "${target}" Pi session using the msg_send tool.\n` +
-          `Your task: ${prompt}\n` +
-          `IMPORTANT: Rephrase this into a natural message in your own words. ` +
-          `Do NOT send the instruction text verbatim. Keep it concise.\n` +
-          `If you want the recipient to reply, use expect_answer=true. ` +
-          `Only use steer=true if the message should interrupt their current work.\n` +
-          `If the target is offline, the message will be queued to its inbox. ` +
-          `Inform the user and do NOT act on the message yourself.`,
-        display: true,
-        details: { target, prompt },
-      });
-      triggerAgentTurn(pi);
+      // Pass triggerTurn so the agent wakes up and sees the instructions immediately.
+      pi.sendMessage(
+        {
+          customType: "msg-tell",
+          content:
+            `Send a message to the "${target}" Pi session using the msg_send tool.\n` +
+            `Your task: ${prompt}\n` +
+            `IMPORTANT: Rephrase this into a natural message in your own words. ` +
+            `Do NOT send the instruction text verbatim. Keep it concise.\n` +
+            `If you want the recipient to reply, use expect_answer=true. ` +
+            `Only use steer=true if the message should interrupt their current work.\n` +
+            `If the target is offline, the message will be queued to its inbox. ` +
+            `Inform the user and do NOT act on the message yourself.`,
+          display: true,
+          details: { target, prompt },
+        },
+        { triggerTurn: true },
+      );
     },
   });
 }
