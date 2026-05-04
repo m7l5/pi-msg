@@ -19,8 +19,15 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { createServer, createConnection } from "node:net";
-import { spawn, execSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { execSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
@@ -28,7 +35,7 @@ import { homedir } from "node:os";
 
 type BridgeMessage =
   | { type: "hello"; from: string; cwd: string }
-  | { type: "text"; from: string; text: string; expectAnswer?: boolean }
+  | { type: "text"; from: string; text: string; expectAnswer?: boolean; steer?: boolean }
   | { type: "bye" };
 
 // ─── State ───────────────────────────────────────────────
@@ -38,9 +45,22 @@ const BRIDGE_DIR = join(homedir(), ".pi", "bridge");
 let server: ReturnType<typeof createServer> | null = null;
 let sessionName: string | null = null;
 let inboxWatcher: ReturnType<typeof import("node:fs").watch> | null = null;
+let watchedInboxName: string | null = null;
+let bridgeRootWatcher: ReturnType<typeof import("node:fs").watch> | null = null;
+let sessionInfoWatcher: ReturnType<typeof import("node:fs").watch> | null = null;
+let watchedSessionFile: string | null = null;
 let inboxMessages: Array<{ from: string; text: string }> = [];
-let pendingTrigger = false;
 let inboxMode = false; // bridge-on but deliver to inbox for review
+let agentBusy = false;
+type PendingBridgeDelivery = {
+  from: string;
+  text: string;
+  direction: "incoming" | "outgoing";
+  to?: string;
+  expectAnswer?: boolean;
+  steer?: boolean;
+};
+let pendingBridgeDeliveries: PendingBridgeDelivery[] = [];
 const recentMessages = new Set<string>();
 function msgHash(from: string, text: string): string {
   return `${from}|${text.slice(0, 200)}`;
@@ -81,7 +101,11 @@ function findSessionFileByName(name: string): SessionLookupResult {
 
   function walk(dir: string): void {
     let entries;
-    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
     for (const entry of entries) {
       const full = join(dir, entry.name);
       if (entry.isDirectory()) {
@@ -98,9 +122,13 @@ function findSessionFileByName(name: string): SessionLookupResult {
                 matches.push(full);
                 break; // one match per file is enough
               }
-            } catch { /* skip */ }
+            } catch {
+              /* skip */
+            }
           }
-        } catch { /* unreadable */ }
+        } catch {
+          /* unreadable */
+        }
       }
     }
   }
@@ -122,9 +150,30 @@ function cwdFromSessionFile(sessionFile: string): string | undefined {
   return "/" + encoded.slice(2, -2).replace(/-/g, "/");
 }
 
+function readSessionNameFromFile(sessionFile: string): string | undefined {
+  try {
+    let name: string | undefined;
+    const lines = readFileSync(sessionFile, "utf-8").split("\n");
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const obj = JSON.parse(line);
+        if (obj.type === "session_info" && typeof obj.name === "string") {
+          name = obj.name;
+        }
+      } catch {
+        /* skip */
+      }
+    }
+    return name;
+  } catch {
+    return undefined;
+  }
+}
+
 // ─── Registry ────────────────────────────────────────────
 // Maps session names → session metadata so other sessions
-// can discover the JSONL path for cold wake-up.
+// can discover the JSONL path and working directory.
 
 const REGISTRY_FILE = join(BRIDGE_DIR, "registry.json");
 
@@ -190,7 +239,7 @@ function isSessionActive(entry: { sessionFile: string; cwd: string }): boolean {
         const target = require("node:fs").readlinkSync(`/proc/${pidDir}/cwd`);
         if (target !== entry.cwd) continue;
         // Must be a Pi or node process (not bash, ssh, etc.)
-        const cmdline = readFileSync(`/proc/${pidDir}/cmdline`, "utf-8").replace(/\0/g, " ");
+        const cmdline = readFileSync(`/proc/${pidDir}/cmdline`, "utf-8").split("\u0000").join(" ");
         if (cmdline.includes("pi") || cmdline.includes("pi-coding-agent")) {
           return true;
         }
@@ -207,18 +256,6 @@ function isSessionActive(entry: { sessionFile: string; cwd: string }): boolean {
 
 function inboxDir(name: string): string {
   return join(BRIDGE_DIR, name, "inbox");
-}
-
-function targetExists(name: string): boolean {
-  // Socket file = currently or recently on bridge
-  if (existsSync(socketPath(name))) return true;
-  // Registry = was on bridge at some point
-  const registry = readRegistry();
-  if (registry[name]) return true;
-  // Session JSONL = a Pi session with this /name exists
-  const lookup = findSessionFileByName(name);
-  if (lookup.file) return true;
-  return false;
 }
 
 function writeInbox(name: string, from: string, text: string): void {
@@ -254,7 +291,11 @@ function drainInbox(name: string): Array<{ from: string; text: string }> {
     .filter((f) => f.endsWith(".json"))
     .sort();
   for (const file of files) {
-    try { unlinkSync(join(dir, file)); } catch { /* ignore */ }
+    try {
+      unlinkSync(join(dir, file));
+    } catch {
+      /* ignore */
+    }
   }
   return messages;
 }
@@ -285,9 +326,7 @@ function probe(name: string): Promise<boolean> {
 
 async function listOnlinePeers(): Promise<string[]> {
   const peers = listPeers();
-  const results = await Promise.all(
-    peers.map(async (name) => ((await probe(name)) ? name : null)),
-  );
+  const results = await Promise.all(peers.map(async (name) => ((await probe(name)) ? name : null)));
   return results.filter((n): n is string => n !== null);
 }
 
@@ -308,28 +347,25 @@ function startBridge(pi: ExtensionAPI, name: string): void {
       buffer = lines.pop() || "";
       for (const line of lines) {
         if (!line.trim()) continue;
+        let msg: BridgeMessage;
         try {
-          const msg: BridgeMessage = JSON.parse(line);
-          if (msg.type === "text") {
-            if (inboxMode) {
-              writeInbox(sessionName!, msg.from, msg.text);
-            } else {
-              const delivered = sendBridgeMessage(pi, msg.from, msg.text, "incoming");
-              if (delivered) {
-                if (msg.expectAnswer) {
-                  // expectAnswer prompt triggers the agent turn on its own — no 👆 needed
-                  pi.sendUserMessage(
-                    `The message above from "${msg.from}" expects a reply. ` +
-                      `Compose a brief response and send it back using bridge_send with target="${msg.from}".`,
-                  );
-                } else {
-                  triggerAgentTurn(pi);
-                }
-              }
-            }
-          }
+          msg = JSON.parse(line);
         } catch {
           // ignore malformed
+          continue;
+        }
+        if (msg.type === "text") {
+          if (inboxMode) {
+            writeInbox(sessionName!, msg.from, msg.text);
+          } else {
+            queueOrDeliverBridgeMessage(pi, {
+              from: msg.from,
+              text: msg.text,
+              direction: "incoming",
+              expectAnswer: msg.expectAnswer,
+              steer: msg.steer,
+            });
+          }
         }
       }
     });
@@ -347,15 +383,27 @@ function startBridge(pi: ExtensionAPI, name: string): void {
 
 function stopBridge(): void {
   if (server) {
-    try { server.close(); } catch { /* ignore */ }
+    try {
+      server.close();
+    } catch {
+      /* ignore */
+    }
     server = null;
   }
   if (inboxWatcher) {
-    try { inboxWatcher.close(); } catch { /* ignore */ }
+    try {
+      inboxWatcher.close();
+    } catch {
+      /* ignore */
+    }
     inboxWatcher = null;
   }
   if (sessionName && existsSync(socketPath(sessionName))) {
-    try { unlinkSync(socketPath(sessionName)); } catch { /* ignore */ }
+    try {
+      unlinkSync(socketPath(sessionName));
+    } catch {
+      /* ignore */
+    }
   }
   sessionName = null;
 }
@@ -366,7 +414,7 @@ function send(target: string, msg: BridgeMessage, fromSession?: string): Promise
   if (fromSession && target === fromSession) {
     return Promise.resolve(""); // silently drop self-messages
   }
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve, _reject) => {
     const sock = createConnection(socketPath(target));
     let reply = "";
     sock.setTimeout(3000, () => {
@@ -389,33 +437,80 @@ function send(target: string, msg: BridgeMessage, fromSession?: string): Promise
 
 // ─── Extension ───────────────────────────────────────────
 
-function sendBridgeMessage(pi: ExtensionAPI, from: string, text: string, direction: "incoming" | "outgoing" = "incoming", to?: string): boolean {
+function sendBridgeMessage(
+  pi: ExtensionAPI,
+  from: string,
+  text: string,
+  direction: "incoming" | "outgoing" = "incoming",
+  to?: string,
+  options: {
+    deliverAs?: "steer" | "followUp" | "nextTurn";
+    triggerTurn?: boolean;
+    expectAnswer?: boolean;
+  } = {},
+): boolean {
   if (direction === "incoming" && isDuplicate(from, text)) return false;
-  // LLM sees the bridge context in content; TUI pulls raw text from details
-  const content = direction === "incoming"
-    ? `📨 [bridge] Message from **${from}**: ${text}`
-    : `📨 [bridge] Message to **${to}**: ${text}`;
-  pi.sendMessage({
-    customType: "bridge-message",
-    content,
-    display: true,
-    details: { from, direction, to, rawText: text },
-  });
+  const content =
+    direction === "incoming"
+      ? `📨 [bridge] Message from **${from}**: ${text}` +
+        (options.expectAnswer
+          ? `\n\nThis bridge message expects a reply. Compose a brief response and send it back using bridge_send with target="${from}".`
+          : "")
+      : `📨 [bridge] Message to **${to}**: ${text}`;
+  pi.sendMessage(
+    {
+      customType: "bridge-message",
+      content,
+      display: true,
+      details: { from, direction, to, rawText: text },
+    },
+    options.deliverAs
+      ? { deliverAs: options.deliverAs }
+      : options.triggerTurn
+        ? { triggerTurn: true }
+        : undefined,
+  );
   return true;
 }
 
-// Trigger agent to respond to bridge messages (custom messages don't auto-start turns)
-function triggerAgentTurn(pi: ExtensionAPI): void {
-  try {
-    pi.sendUserMessage("👆");
-    pendingTrigger = false;
-  } catch (e: any) {
-    if (e?.message?.includes("already processing")) {
-      pendingTrigger = true;
-    } else {
-      throw e;
-    }
+function deliverBridgeMessage(
+  pi: ExtensionAPI,
+  delivery: PendingBridgeDelivery,
+  triggerTurn: boolean,
+): boolean {
+  const deliverAs = agentBusy && delivery.steer ? "steer" : undefined;
+  return sendBridgeMessage(pi, delivery.from, delivery.text, delivery.direction, delivery.to, {
+    deliverAs,
+    triggerTurn: delivery.direction === "incoming" && triggerTurn,
+    expectAnswer: delivery.expectAnswer,
+  });
+}
+
+function queueOrDeliverBridgeMessage(pi: ExtensionAPI, delivery: PendingBridgeDelivery): boolean {
+  if (agentBusy && !delivery.steer) {
+    pendingBridgeDeliveries.push(delivery);
+    return false;
   }
+  if (agentBusy && delivery.direction === "outgoing") {
+    pendingBridgeDeliveries.push(delivery);
+    return false;
+  }
+  return deliverBridgeMessage(pi, delivery, true);
+}
+
+function flushPendingBridgeDeliveries(pi: ExtensionAPI): void {
+  if (agentBusy || pendingBridgeDeliveries.length === 0) return;
+  const pending = pendingBridgeDeliveries;
+  pendingBridgeDeliveries = [];
+  const lastIncomingIndex = pending.map((d) => d.direction).lastIndexOf("incoming");
+  for (let i = 0; i < pending.length; i += 1) {
+    deliverBridgeMessage(pi, pending[i], i === lastIncomingIndex);
+  }
+}
+
+// Trigger agent to respond to manually injected inbox/compose messages.
+function triggerAgentTurn(pi: ExtensionAPI): void {
+  pi.sendUserMessage("👆", { deliverAs: "followUp" });
 }
 
 // Inject many messages — each gets its own bubble + triggers agent
@@ -436,34 +531,60 @@ export default function sessionBridgeExtension(pi: ExtensionAPI) {
     const details = message.details as { target: string; prompt: string } | undefined;
     const target = details?.target ?? "?";
     const prompt = details?.prompt ?? "";
-    const label = theme.fg("muted", `compose → ${target}`);
+    const label = theme.fg("muted", `Composing message to: ${target}`);
     const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
     // Always show the prompt so user remembers what they asked
     let text = `${label}\n${theme.fg("customMessageText", prompt)}`;
     // Expanded shows the full instructions sent to the agent
     if (expanded && message.content) {
-      text += `\n\n${theme.fg("dim", message.content)}`;
+      const contentText =
+        typeof message.content === "string" ? message.content : JSON.stringify(message.content);
+      text += `\n\n${theme.fg("dim", contentText)}`;
     }
     box.addChild(new Text(text, 0, 0));
     return box;
   });
 
   pi.registerMessageRenderer("bridge-message", (message, { expanded }, theme) => {
-    const details = message.details as { from: string; to?: string; direction: "incoming" | "outgoing"; rawText?: string } | undefined;
+    const details = message.details as
+      | { from: string; to?: string; direction: "incoming" | "outgoing"; rawText?: string }
+      | undefined;
     const from = details?.from ?? "bridge";
     const to = details?.to;
     const direction = details?.direction ?? "incoming";
-    const rawText = details?.rawText ?? message.content;
+    const rawText =
+      details?.rawText ??
+      (typeof message.content === "string" ? message.content : JSON.stringify(message.content));
 
     const isIncoming = direction === "incoming";
-    const labelColor = isIncoming ? "accent" : "success";
-    const arrow = isIncoming ? "←" : "→";
-    const label = to
-      ? theme.fg(labelColor, `${from} ${arrow} ${to}`)
-      : theme.fg(labelColor, `${arrow} ${from}`);
+    const label = isIncoming
+      ? theme.fg("muted", `Received from: ${from}`)
+      : theme.fg("muted", `Sending to: ${to ?? "bridge"}`);
 
     const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
-    box.addChild(new Text(`${label}\n${theme.fg("customMessageText", rawText)}`, 0, 0));
+    let text = label;
+    if (expanded) {
+      text += `\n${theme.fg("customMessageText", rawText)}`;
+    } else {
+      const preview = rawText.length > 250 ? rawText.slice(0, 250) + "…" : rawText;
+      text += `\n${theme.fg("customMessageText", preview)}`;
+    }
+    box.addChild(new Text(text, 0, 0));
+
+    if (!expanded && rawText.length > 250) {
+      const remaining = rawText.length - 250;
+      box.addChild(
+        new Text(
+          theme.fg(
+            "dim",
+            `${remaining} more character${remaining > 1 ? "s" : ""} · Ctrl+O to expand`,
+          ),
+          0,
+          0,
+        ),
+      );
+    }
+
     return box;
   });
 
@@ -471,16 +592,20 @@ export default function sessionBridgeExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", () => {
     stopBridge();
     stopInboxWatcher();
+    stopBridgeRootWatcher();
+    stopSessionInfoWatcher();
   });
 
   // Always-on inbox watcher (bridge off → notify, bridge on → socket handles it)
   function startInboxWatcher(
     piSessionName: string,
-    notify: (msg: string, level: "info" | "success" | "warning" | "error") => void,
+    notify: (msg: string, level: "info" | "warning" | "error") => void,
   ): void {
-    if (inboxWatcher) return;
+    if (inboxWatcher && watchedInboxName === piSessionName) return;
+    stopInboxWatcher();
     const dir = inboxDir(piSessionName);
     mkdirSync(dir, { recursive: true });
+    watchedInboxName = piSessionName;
     try {
       inboxWatcher = (require("node:fs") as typeof import("node:fs")).watch(
         dir,
@@ -508,23 +633,53 @@ export default function sessionBridgeExtension(pi: ExtensionAPI) {
         },
       );
     } catch {
+      watchedInboxName = null;
       // fs.watch not available
     }
   }
 
   function stopInboxWatcher(): void {
     if (inboxWatcher) {
-      try { inboxWatcher.close(); } catch { /* ignore */ }
+      try {
+        inboxWatcher.close();
+      } catch {
+        /* ignore */
+      }
       inboxWatcher = null;
+    }
+    watchedInboxName = null;
+  }
+
+  function stopBridgeRootWatcher(): void {
+    if (bridgeRootWatcher) {
+      try {
+        bridgeRootWatcher.close();
+      } catch {
+        /* ignore */
+      }
+      bridgeRootWatcher = null;
     }
   }
 
-  // Start watcher on session start if session has a name
-  // Also drain existing inbox files that arrived while offline
-  pi.on("session_start", async (_event, ctx) => {
-    const name = ctx.sessionManager.getSessionName();
+  function stopSessionInfoWatcher(): void {
+    if (sessionInfoWatcher) {
+      try {
+        sessionInfoWatcher.close();
+      } catch {
+        /* ignore */
+      }
+      sessionInfoWatcher = null;
+    }
+    watchedSessionFile = null;
+  }
+
+  function watchNamedInbox(
+    name: string | undefined,
+    notify: (msg: string, level: "info" | "warning" | "error") => void,
+    delayNotify = false,
+  ): void {
     if (!name) return;
-    startInboxWatcher(name, (msg, level) => ctx.ui.notify(msg, level));
+    startInboxWatcher(name, notify);
 
     // Peek without deleting — only user actions (accept/dismiss/clear) drain files
     const pending = peekInbox(name);
@@ -542,31 +697,101 @@ export default function sessionBridgeExtension(pi: ExtensionAPI) {
     const newMsgs = pending.filter((m) => !existing.has(m.text));
     if (newMsgs.length === 0) return;
     inboxMessages.push(...newMsgs);
-    // TUI may not be ready at session_start — delay the notification
-    setTimeout(() => {
-      ctx.ui.notify(
-        `📨 ${inboxMessages.length} pending bridge message(s). Use /bridge-inbox.`,
-        "info",
+    const showNotification = () =>
+      notify(`📨 ${inboxMessages.length} pending bridge message(s). Use /bridge-inbox.`, "info");
+    if (delayNotify) setTimeout(showNotification, 500);
+    else showNotification();
+  }
+
+  function startBridgeRootWatcher(
+    getName: () => string | undefined,
+    notify: (msg: string, level: "info" | "warning" | "error") => void,
+  ): void {
+    if (bridgeRootWatcher) return;
+    mkdirSync(BRIDGE_DIR, { recursive: true });
+    try {
+      bridgeRootWatcher = (require("node:fs") as typeof import("node:fs")).watch(BRIDGE_DIR, () => {
+        const name = getName();
+        if (name && existsSync(inboxDir(name))) {
+          watchNamedInbox(name, notify);
+        }
+      });
+    } catch {
+      // root watch unavailable; direct inbox watcher still works once started
+    }
+  }
+
+  function startSessionInfoWatcher(
+    sessionFile: string | undefined,
+    notify: (msg: string, level: "info" | "warning" | "error") => void,
+  ): void {
+    if (!sessionFile || watchedSessionFile === sessionFile) return;
+    stopSessionInfoWatcher();
+    watchedSessionFile = sessionFile;
+    try {
+      sessionInfoWatcher = (require("node:fs") as typeof import("node:fs")).watch(
+        sessionFile,
+        () => {
+          const name = readSessionNameFromFile(sessionFile);
+          if (name && name !== watchedInboxName) {
+            watchNamedInbox(name, notify);
+          }
+        },
       );
-    }, 500);
+    } catch {
+      watchedSessionFile = null;
+    }
+  }
+
+  // Start watcher on session start if session has a name
+  // Also drain existing inbox files that arrived while offline
+  pi.on("session_start", async (_event, ctx) => {
+    const notify = (msg: string, level: "info" | "warning" | "error") => ctx.ui.notify(msg, level);
+    startBridgeRootWatcher(() => ctx.sessionManager.getSessionName(), notify);
+
+    // Session file may not exist yet at startup; retry a few times
+    const file = ctx.sessionManager.getSessionFile();
+    if (file) {
+      startSessionInfoWatcher(file, notify);
+    } else {
+      let attempts = 0;
+      const tryLater = () => {
+        attempts += 1;
+        const f = ctx.sessionManager.getSessionFile();
+        if (f) {
+          startSessionInfoWatcher(f, notify);
+          return;
+        }
+        if (attempts < 6) setTimeout(tryLater, 500);
+      };
+      setTimeout(tryLater, 500);
+    }
+
+    watchNamedInbox(ctx.sessionManager.getSessionName(), notify, true);
   });
 
-  // Drain pending triggers when agent finishes
+  pi.on("agent_start", () => {
+    agentBusy = true;
+  });
+
   pi.on("agent_end", () => {
-    if (pendingTrigger) {
-      pendingTrigger = false;
-      try {
-        pi.sendUserMessage("👆");
-      } catch (e: any) {
-        if (!e?.message?.includes("already processing")) throw e;
-      }
-    }
+    setTimeout(() => {
+      agentBusy = false;
+      flushPendingBridgeDeliveries(pi);
+    }, 0);
   });
 
   // Always inject bridge context into system prompt (bridge_send works without /bridge-on)
-  pi.on("before_agent_start", async (_event, ctx) => {
+  (pi as any).on("before_agent_start", async (_event: any, ctx: any) => {
     const name = ctx.sessionManager.getSessionName() || getHostName();
-    const status = server ? `You are joined to the bridge as "${sessionName}".` : "You are NOT joined to the bridge.";
+    // Proactive check: name may have changed via /name and the session-file watcher
+    // may have missed it (file wasn't available at startup). Catch it here before the agent runs.
+    if (name && name !== watchedInboxName) {
+      watchNamedInbox(name, (msg, level) => ctx.ui.notify(msg, level));
+    }
+    const status = server
+      ? `You are joined to the bridge as "${sessionName}".`
+      : "You are NOT joined to the bridge.";
     const bridgePrompt =
       `${status} Your bridge name is "${name}".\n\n` +
       "Other Pi sessions can send you messages and you can send messages to them.\n\n" +
@@ -580,7 +805,10 @@ export default function sessionBridgeExtension(pi: ExtensionAPI) {
       "Only send bridge messages when explicitly asked by the user. " +
       "When you receive a bridge message, respond naturally as if that person sent it.\n" +
       "To ask for a reply, set expect_answer=true on bridge_send. " +
-      "The recipient's agent will automatically compose and send a response.";
+      "The recipient's agent will automatically compose and send a response. " +
+      "By default, bridge messages do not interrupt a busy agent; use steer=true only for urgent messages that should affect the current turn.\n" +
+      "IMPORTANT: If the target session is offline, the message is queued to its inbox. " +
+      "Inform the user that the message was queued. Do NOT decide to act on the message yourself — wait for the user to tell you what to do next.";
     return {
       messages: [{ role: "system", content: bridgePrompt }],
     };
@@ -588,11 +816,13 @@ export default function sessionBridgeExtension(pi: ExtensionAPI) {
 
   // ── /bridge-on ─────────────────────────────────────────
   pi.registerCommand("bridge-on", {
-    description: "Join the session bridge. Use --inbox to queue messages for review instead of real-time delivery.",
+    description:
+      "Join the session bridge. Use --inbox to queue messages for review instead of real-time delivery.",
     handler: async (args, ctx) => {
       const raw = (args || "").trim();
       inboxMode = raw.includes("--inbox");
-      const name = raw.replace("--inbox", "").trim() || ctx.sessionManager.getSessionName() || getHostName();
+      const name =
+        raw.replace("--inbox", "").trim() || ctx.sessionManager.getSessionName() || getHostName();
       if (ctx.sessionManager.getSessionName() === name && server) {
         ctx.ui.notify(`Already on bridge as "${name}"`, "info");
         return;
@@ -640,22 +870,29 @@ export default function sessionBridgeExtension(pi: ExtensionAPI) {
       }
       if (inboxMessages.length > 0) {
         if (inboxMode) {
-          ctx.ui.notify(`Joined bridge as "${name}" (inbox mode). ${inboxMessages.length} message(s) queued. Use /bridge-inbox to review.`, "info");
+          ctx.ui.notify(
+            `Joined bridge as "${name}" (inbox mode). ${inboxMessages.length} message(s) queued. Use /bridge-inbox to review.`,
+            "info",
+          );
         } else {
           const toInject = [...inboxMessages];
           inboxMessages = [];
           injectMany(pi, toInject);
-          ctx.ui.notify(`Joined bridge — delivering ${toInject.length} pending message(s)...`, "success");
+          ctx.ui.notify(
+            `Joined bridge — delivering ${toInject.length} pending message(s)...`,
+            "info",
+          );
         }
       } else {
-        ctx.ui.notify(`Joined bridge as "${name}"${inboxMode ? " (inbox mode)" : ""}`, "success");
+        ctx.ui.notify(`Joined bridge as "${name}"${inboxMode ? " (inbox mode)" : ""}`, "info");
       }
     },
   });
 
   // ── /bridge-inbox ──────────────────────────────────────
   pi.registerCommand("bridge-inbox", {
-    description: "Check pending bridge messages. Use 'accept <n>' to inject or 'dismiss <n>' to discard.",
+    description:
+      "Check pending bridge messages. Use 'read <n>' to preview full text, 'accept <n>' to inject, or 'dismiss <n>' to discard.",
     handler: async (args, ctx) => {
       const name = ctx.sessionManager.getSessionName() || getHostName();
 
@@ -681,7 +918,16 @@ export default function sessionBridgeExtension(pi: ExtensionAPI) {
 
       if (action === "dismiss" && index >= 0 && index < inboxMessages.length) {
         const removed = inboxMessages.splice(index, 1)[0];
-        ctx.ui.notify(`Dismissed message from "${removed.from}". ${inboxMessages.length} remaining.`, "info");
+        ctx.ui.notify(
+          `Dismissed message from "${removed.from}". ${inboxMessages.length} remaining.`,
+          "info",
+        );
+        return;
+      }
+
+      if ((action === "read" || action === "show") && index >= 0 && index < inboxMessages.length) {
+        const msg = inboxMessages[index];
+        ctx.ui.notify(`📨 ${index + 1}. From **${msg.from}**:\n\n${msg.text}`, "info");
         return;
       }
 
@@ -690,7 +936,7 @@ export default function sessionBridgeExtension(pi: ExtensionAPI) {
         const [accepted] = inboxMessages.splice(index, 1);
         sendBridgeMessage(pi, accepted.from, accepted.text, "incoming");
         triggerAgentTurn(pi);
-        ctx.ui.notify(`Injected message from "${accepted.from}".`, "success");
+        ctx.ui.notify(`Injected message from "${accepted.from}".`, "info");
         return;
       }
 
@@ -699,7 +945,7 @@ export default function sessionBridgeExtension(pi: ExtensionAPI) {
         const toInject = [...inboxMessages];
         inboxMessages = [];
         injectMany(pi, toInject);
-        ctx.ui.notify(`Injecting ${toInject.length} bridge message(s) one by one...`, "success");
+        ctx.ui.notify(`Injecting ${toInject.length} bridge message(s) one by one...`, "info");
         return;
       }
 
@@ -709,10 +955,13 @@ export default function sessionBridgeExtension(pi: ExtensionAPI) {
       }
 
       const list = inboxMessages
-        .map((m, i) => `  ${i + 1}. **${m.from}**: ${m.text.slice(0, 80)}${m.text.length > 80 ? "…" : ""}`)
+        .map(
+          (m, i) =>
+            `  ${i + 1}. **${m.from}**: ${m.text.slice(0, 80)}${m.text.length > 80 ? "…" : ""}`,
+        )
         .join("\n");
       ctx.ui.notify(
-        `📨 ${inboxMessages.length} pending:\n${list}\n\n/bridge-inbox accept <n>  — inject one\n/bridge-inbox dismiss <n> — discard one\n/bridge-inbox accept     — inject all\n/bridge-inbox clear      — discard all`,
+        `📨 ${inboxMessages.length} pending:\n${list}\n\n/bridge-inbox read <n>    — preview full message\n/bridge-inbox accept <n>  — inject one\n/bridge-inbox dismiss <n> — discard one\n/bridge-inbox accept     — inject all\n/bridge-inbox clear      — discard all`,
         "info",
       );
     },
@@ -720,7 +969,8 @@ export default function sessionBridgeExtension(pi: ExtensionAPI) {
 
   // ── /bridge-inbox-mode ────────────────────────────────
   pi.registerCommand("bridge-inbox-mode", {
-    description: "Toggle inbox mode while on the bridge. Messages queue for review instead of real-time delivery.",
+    description:
+      "Toggle inbox mode while on the bridge. Messages queue for review instead of real-time delivery.",
     handler: async (args, ctx) => {
       if (!server) {
         ctx.ui.notify("Join the bridge first with /bridge-on", "error");
@@ -734,7 +984,10 @@ export default function sessionBridgeExtension(pi: ExtensionAPI) {
         inboxMode = false;
         ctx.ui.notify("Inbox mode disabled — real-time delivery restored.", "info");
       } else {
-        ctx.ui.notify(`Inbox mode is ${inboxMode ? "ON" : "OFF"}. Usage: /bridge-inbox-mode on|off`, "info");
+        ctx.ui.notify(
+          `Inbox mode is ${inboxMode ? "ON" : "OFF"}. Usage: /bridge-inbox-mode on|off`,
+          "info",
+        );
       }
     },
   });
@@ -750,7 +1003,7 @@ export default function sessionBridgeExtension(pi: ExtensionAPI) {
       const name = sessionName;
       if (name) unregisterSession(name);
       stopBridge();
-      ctx.ui.notify(`Left bridge (was "${name}")`, "success");
+      ctx.ui.notify(`Left bridge (was "${name}")`, "info");
     },
   });
 
@@ -767,7 +1020,7 @@ export default function sessionBridgeExtension(pi: ExtensionAPI) {
       // Try registry first, then filesystem scan
       let sessionFile: string | undefined;
       const registry = readRegistry();
-      const entry = Object.values(registry).find((e) => e.sessionName === name);
+      const entry = Object.values(registry).find((e) => e.name === name);
       if (entry) {
         sessionFile = entry.sessionFile;
       } else {
@@ -794,9 +1047,8 @@ export default function sessionBridgeExtension(pi: ExtensionAPI) {
         ? isSessionActive(entry)
         : isSessionActive({ sessionFile, cwd: cwdFromSessionFile(sessionFile) || "" });
       ctx.ui.notify(
-        `"${name}" → ${sessionFile}\n` +
-          `Active: ${active ? "YES 🛑" : "NO ✅"}`,
-        active ? "warning" : "success",
+        `"${name}" → ${sessionFile}\n` + `Active: ${active ? "YES 🛑" : "NO ✅"}`,
+        active ? "warning" : "info",
       );
     },
   });
@@ -820,11 +1072,13 @@ export default function sessionBridgeExtension(pi: ExtensionAPI) {
 
   // ── /bridge-send ───────────────────────────────────────
   pi.registerCommand("bridge-send", {
-    description: "Send a raw message to a session (no bridge join required). Use --expect-answer to request an auto-reply.",
+    description:
+      "Send a raw message to a session (no bridge join required). Use --expect-answer to request an auto-reply; --steer to interrupt a busy agent.",
     handler: async (args, ctx) => {
       const raw = (args || "").trim();
       const expectAnswer = raw.includes("--expect-answer");
-      const rest = raw.replace("--expect-answer", "").trim();
+      const steer = raw.includes("--steer");
+      const rest = raw.replace("--expect-answer", "").replace("--steer", "").trim();
       const parts = rest.split(/\s+/);
       const target = parts[0];
       const text = parts.slice(1).join(" ");
@@ -832,8 +1086,10 @@ export default function sessionBridgeExtension(pi: ExtensionAPI) {
         ctx.ui.notify("Usage: /bridge-send <name> <message>", "error");
         return;
       }
-      // Fast path: check bridge first (socket/registry), then scan sessions
-      const onBridge = existsSync(socketPath(target)) || !!readRegistry()[target];
+      // Fast path: check bridge first (socket/registry/inbox), then scan sessions
+      const onBridge =
+        existsSync(socketPath(target)) || existsSync(inboxDir(target)) || !!readRegistry()[target];
+      let unknownTarget = false;
       if (!onBridge) {
         const lookup = findSessionFileByName(target);
         if (lookup.collision) {
@@ -843,13 +1099,7 @@ export default function sessionBridgeExtension(pi: ExtensionAPI) {
           );
           return;
         }
-        if (!lookup.file) {
-          ctx.ui.notify(
-            `No session or bridge node named "${target}" found.`,
-            "error",
-          );
-          return;
-        }
+        unknownTarget = !lookup.file;
       }
 
       const from = ctx.sessionManager.getSessionName() || getHostName();
@@ -858,13 +1108,21 @@ export default function sessionBridgeExtension(pi: ExtensionAPI) {
         return;
       }
       const online = await probe(target);
-      const msg: BridgeMessage = { type: "text", from, text, expectAnswer };
+      const msg: BridgeMessage = { type: "text", from, text, expectAnswer, steer };
       if (online) {
         await send(target, msg, sessionName ?? undefined);
-        ctx.ui.notify(`Sent to "${target}"${expectAnswer ? " (expects answer)" : ""}`, "success");
+        ctx.ui.notify(
+          `Sent to "${target}"${expectAnswer ? " (expects answer)" : ""}${steer ? " (steer)" : ""}`,
+          "info",
+        );
       } else {
         writeInbox(target, from, text);
-        ctx.ui.notify(`"${target}" is offline — message queued to inbox.`, "info");
+        ctx.ui.notify(
+          unknownTarget
+            ? `No session with messages named "${target}" was found — dropped message in its inbox in case it is watching.`
+            : `"${target}" is offline — message queued to inbox.`,
+          "info",
+        );
       }
     },
   });
@@ -875,15 +1133,32 @@ export default function sessionBridgeExtension(pi: ExtensionAPI) {
     label: "Bridge Send",
     description:
       "Send a message to another Pi session. " +
-      "Use expect_answer=true to ask the recipient's agent to auto-reply.",
+      "Use expect_answer=true to ask the recipient's agent to auto-reply. " +
+      "Use steer=true only when the message should interrupt the recipient's current agent turn. " +
+      "If the target is offline, the message is queued to its inbox — inform the user and do NOT act on the message yourself.",
     parameters: Type.Object({
       target: Type.String({ description: "Name of the target session on the bridge" }),
       text: Type.String({ description: "The message to send" }),
-      expect_answer: Type.Optional(Type.Boolean({ description: "Ask recipient to auto-reply. When true, their agent composes and sends a response back on its own." })),
+      expect_answer: Type.Optional(
+        Type.Boolean({
+          description:
+            "Ask recipient to auto-reply. When true, their agent composes and sends a response back on its own.",
+        }),
+      ),
+      steer: Type.Optional(
+        Type.Boolean({
+          description:
+            "Interrupt the recipient's current agent turn if one is running. Default false queues until the turn ends.",
+        }),
+      ),
     }),
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      // Fast path: check bridge first (socket/registry), then scan sessions
-      const onBridge = existsSync(socketPath(params.target)) || !!readRegistry()[params.target];
+      // Fast path: check bridge first (socket/registry/inbox), then scan sessions
+      const onBridge =
+        existsSync(socketPath(params.target)) ||
+        existsSync(inboxDir(params.target)) ||
+        !!readRegistry()[params.target];
+      let unknownTarget = false;
       if (!onBridge) {
         const lookup = findSessionFileByName(params.target);
         if (lookup.collision) {
@@ -897,12 +1172,7 @@ export default function sessionBridgeExtension(pi: ExtensionAPI) {
             details: {},
           };
         }
-        if (!lookup.file) {
-          return {
-            content: [{ type: "text", text: `No session or bridge node named "${params.target}" found.` }],
-            details: {},
-          };
-        }
+        unknownTarget = !lookup.file;
       }
 
       const from = ctx.sessionManager.getSessionName() || getHostName();
@@ -913,27 +1183,72 @@ export default function sessionBridgeExtension(pi: ExtensionAPI) {
         };
       }
       const online = await probe(params.target);
-      const msg: BridgeMessage = { type: "text", from, text: params.text, expectAnswer: params.expect_answer };
+      const details = {
+        target: params.target,
+        text: params.text,
+        expectAnswer: params.expect_answer === true,
+        steer: params.steer === true,
+        status: online ? "sent" : "queued",
+      };
+      const msg: BridgeMessage = {
+        type: "text",
+        from,
+        text: params.text,
+        expectAnswer: params.expect_answer,
+        steer: params.steer,
+      };
       if (online) {
         await send(params.target, msg, sessionName ?? undefined);
-        sendBridgeMessage(pi, from, params.text, "outgoing", params.target);
         return {
-          content: [{ type: "text", text: `Message sent to "${params.target}".` }],
-          details: {},
+          content: [{ type: "text", text: `Sent to ${params.target}: ${params.text}` }],
+          details,
         };
       }
       writeInbox(params.target, from, params.text);
-      // Note: expectAnswer is lost for offline delivery (inbox doesn't preserve it yet)
-      sendBridgeMessage(pi, from, params.text, "outgoing", params.target);
+      // Note: expectAnswer/steer are lost for offline delivery (inbox doesn't preserve them yet)
       return {
         content: [
           {
             type: "text",
-            text: `"${params.target}" is offline. Message queued and will be delivered on next startup.`,
+            text: unknownTarget
+              ? `No session with messages named "${params.target}" was found; dropped message in its inbox in case it is watching: ${params.text}`
+              : `Queued for ${params.target}: ${params.text}`,
           },
         ],
-        details: {},
+        details,
       };
+    },
+
+    renderCall(args, theme) {
+      const flags = [
+        args.expect_answer ? "expects answer" : undefined,
+        args.steer ? "steer" : undefined,
+      ].filter(Boolean);
+      const lines = [
+        theme.fg("toolTitle", theme.bold(`bridge_send to: ${args.target ?? "?"}`)),
+        flags.length > 0 ? theme.fg("dim", flags.join(" · ")) : undefined,
+      ].filter(Boolean);
+      return new Text(lines.join("\n"), 0, 0);
+    },
+
+    renderResult(result, { expanded, isPartial }, theme) {
+      if (isPartial) {
+        return new Text(theme.fg("warning", "Sending…"), 0, 0);
+      }
+      const details = result.details as { text: string } | undefined;
+      const fullText = details?.text ?? "";
+
+      if (expanded) {
+        return new Text(theme.fg("customMessageText", fullText), 0, 0);
+      }
+
+      const preview = fullText.length > 250 ? fullText.slice(0, 250) + "…" : fullText;
+      let text = theme.fg("customMessageText", preview);
+      if (fullText.length > 250) {
+        const remaining = fullText.length - 250;
+        text += `\n${theme.fg("dim", `${remaining} more character${remaining > 1 ? "s" : ""} · Ctrl+O to expand`)}`;
+      }
+      return new Text(text, 0, 0);
     },
   });
 
@@ -959,13 +1274,14 @@ export default function sessionBridgeExtension(pi: ExtensionAPI) {
           `Your task: ${prompt}\n` +
           `IMPORTANT: Rephrase this into a natural message in your own words. ` +
           `Do NOT send the instruction text verbatim. Keep it concise.\n` +
-          `If you want the recipient to reply, use expect_answer=true.`,
+          `If you want the recipient to reply, use expect_answer=true. ` +
+          `Only use steer=true if the message should interrupt their current work.\n` +
+          `If the target is offline, the message will be queued to its inbox. ` +
+          `Inform the user and do NOT act on the message yourself.`,
         display: true,
         details: { target, prompt },
       });
-      pi.sendUserMessage("👆");
+      triggerAgentTurn(pi);
     },
   });
-
 }
-

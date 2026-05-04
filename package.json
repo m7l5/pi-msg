@@ -2,9 +2,29 @@
   "name": "pi-session-bridge",
   "version": "0.1.0",
   "description": "Let Pi sessions talk to each other via Unix sockets",
-  "keywords": ["pi-package", "pi-extension"],
+  "keywords": [
+    "pi-package",
+    "pi-extension"
+  ],
   "license": "Apache-2.0",
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "build": "tsgo --project tsconfig.json",
+    "typecheck": "tsgo --noEmit --project tsconfig.json",
+    "lint": "oxlint index.ts",
+    "format": "oxfmt index.ts"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "^0.72.1",
+    "@mariozechner/pi-tui": "^0.72.1",
+    "@types/node": "latest",
+    "@typescript/native-preview": "7.0.0-dev.20260502.1",
+    "oxfmt": "latest",
+    "oxlint": "latest",
+    "typebox": "^1.1.37"
   }
 }
