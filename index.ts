@@ -481,9 +481,10 @@ function deliverMsgMessage(
   const deliverAs = agentBusy && delivery.steer ? "steer" : undefined;
   return sendMsgMessage(pi, delivery.from, delivery.text, delivery.direction, delivery.to, {
     deliverAs,
-    // Only trigger the agent when the incoming msg explicitly asks for a reply.
-    // Passive msgs (expectAnswer=false) just appear in context; the user sees the bubble.
-    triggerTurn: delivery.direction === "incoming" && triggerTurn && delivery.expectAnswer === true,
+    // Trigger the agent for any real-time or explicitly accepted incoming msg
+    // so it can read the message and act on it. expectAnswer only controls
+    // whether the agent should compose a reply back, not whether it wakes up.
+    triggerTurn: delivery.direction === "incoming" && triggerTurn,
     expectAnswer: delivery.expectAnswer,
   });
 }
@@ -504,12 +505,10 @@ function flushPendingMsgDeliveries(pi: ExtensionAPI): void {
   if (agentBusy || pendingMsgDeliveries.length === 0) return;
   const pending = pendingMsgDeliveries;
   pendingMsgDeliveries = [];
-  // Only trigger the last incoming msg that explicitly expects an answer.
-  const lastExpectAnswerIndex = pending
-    .map((d) => d.direction === "incoming" && d.expectAnswer === true)
-    .lastIndexOf(true);
+  // Trigger the last incoming msg so the agent wakes up and sees everything.
+  const lastIncomingIndex = pending.map((d) => d.direction).lastIndexOf("incoming");
   for (let i = 0; i < pending.length; i += 1) {
-    deliverMsgMessage(pi, pending[i], i === lastExpectAnswerIndex);
+    deliverMsgMessage(pi, pending[i], i === lastIncomingIndex);
   }
 }
 
