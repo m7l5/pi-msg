@@ -1,6 +1,6 @@
 {
   "name": "pi-msg",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Let Pi sessions talk to each other via Unix sockets",
   "keywords": [
     "pi-package",
